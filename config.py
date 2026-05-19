@@ -32,8 +32,9 @@ class Config:
     # Cooldown apos disparar pra evitar repeticao.
     cooldown_ms: int = 800
 
-    # Keep-alive nos devices (segundos).
-    keepalive_s: float = 3.0
+    # Keep-alive nos devices (segundos). 1.5s evita teclados BT dormirem
+    # fundo demais entre pings (3s+ deixa K850 cair em deep sleep).
+    keepalive_s: float = 1.5
 
     # Pausado? (controlado pelo tray)
     paused: bool = False

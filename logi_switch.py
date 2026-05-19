@@ -119,16 +119,23 @@ def get_hosts_info(h, dev_idx):
     return {'feat_idx': feat_idx, 'num_hosts': resp[4], 'current_host': resp[5]}
 
 
-def set_host(h, dev_idx, host_idx):
-    feat_idx = get_feature_index(h, dev_idx, FEAT_CHANGE_HOST)
-    if feat_idx is None:
-        return False, 'CHANGE_HOST nao suportado / sem resposta'
-    resp = hidpp_call(h, dev_idx, feat_idx, 1, bytes([host_idx]), timeout_ms=300)
-    if resp is None:
-        return True, 'sent (sem ack)'
-    if resp[2] in (ERR_HIDPP10, ERR_HIDPP20):
-        return False, f'erro 0x{resp[4]:02X}'
-    return True, 'ack'
+def set_host(h, dev_idx, host_idx, retries=2):
+    """Tenta CHANGE_HOST com retry. Em teclados BT que dormem, a primeira
+    tentativa as vezes so acorda o radio sem efetuar a troca."""
+    for attempt in range(retries + 1):
+        feat_idx = get_feature_index(h, dev_idx, FEAT_CHANGE_HOST)
+        if feat_idx is None:
+            if attempt < retries:
+                # device pode estar dormindo - espera e tenta de novo
+                time.sleep(0.1)
+                continue
+            return False, 'CHANGE_HOST nao suportado / sem resposta'
+        resp = hidpp_call(h, dev_idx, feat_idx, 1, bytes([host_idx]), timeout_ms=300)
+        if resp is None:
+            return True, 'sent (sem ack)'
+        if resp[2] in (ERR_HIDPP10, ERR_HIDPP20):
+            return False, f'erro 0x{resp[4]:02X}'
+        return True, 'ack'
 
 
 def keep_awake(h, dev_idx):
@@ -142,12 +149,13 @@ def keep_awake(h, dev_idx):
         return False
 
 
-def wake_burst(h, dev_idx, attempts=3):
+def wake_burst(h, dev_idx, attempts=8, gap_ms=50):
+    """Spread bursts mais largos pra dar tempo do radio BT acordar (~400ms)."""
     ok = False
     for _ in range(attempts):
         if keep_awake(h, dev_idx):
             ok = True
-        time.sleep(0.02)
+        time.sleep(gap_ms / 1000)
     return ok
 
 
