@@ -119,23 +119,23 @@ def get_hosts_info(h, dev_idx):
     return {'feat_idx': feat_idx, 'num_hosts': resp[4], 'current_host': resp[5]}
 
 
-def set_host(h, dev_idx, host_idx, retries=2):
-    """Tenta CHANGE_HOST com retry. Em teclados BT que dormem, a primeira
-    tentativa as vezes so acorda o radio sem efetuar a troca."""
-    for attempt in range(retries + 1):
+def set_host(h, dev_idx, host_idx, feat_idx=None):
+    """Dispara CHANGE_HOST.SetCurrentHost. Estilo Solaar: no_reply=True,
+    fire-and-forget. Se feat_idx for cacheado, evita o round-trip de
+    descoberta (que falha quando teclado esta ocupado entregando input)."""
+    if feat_idx is None:
         feat_idx = get_feature_index(h, dev_idx, FEAT_CHANGE_HOST)
         if feat_idx is None:
-            if attempt < retries:
-                # device pode estar dormindo - espera e tenta de novo
-                time.sleep(0.1)
-                continue
             return False, 'CHANGE_HOST nao suportado / sem resposta'
-        resp = hidpp_call(h, dev_idx, feat_idx, 1, bytes([host_idx]), timeout_ms=300)
-        if resp is None:
-            return True, 'sent (sem ack)'
-        if resp[2] in (ERR_HIDPP10, ERR_HIDPP20):
-            return False, f'erro 0x{resp[4]:02X}'
-        return True, 'ack'
+    # Write direto, sem esperar resposta (CHANGE_HOST nao garante reply -
+    # o device pode estar pulando de host quando o ack seria devido)
+    payload = bytes([REPORT_SHORT, dev_idx, feat_idx,
+                     (1 << 4) | SW_ID, host_idx, 0, 0])
+    try:
+        h.write(payload)
+        return True, 'sent'
+    except Exception as e:
+        return False, f'write error: {e}'
 
 
 def keep_awake(h, dev_idx):
@@ -230,6 +230,7 @@ def discover_targets(verbose=False):
                 targets.append({
                     'name': product, 'product_id': pid, 'usage_page': usage,
                     'dev_idx': 0x00, 'handle': h,
+                    'change_host_feat_idx': res['feat_idx'],  # cache - evita lookup no switch
                     'num_hosts': res['num_hosts'],
                     'current_host': res['current_host'],
                 })
@@ -253,6 +254,7 @@ def discover_targets(verbose=False):
                     targets.append({
                         'name': f"{product}/dev{di}", 'product_id': pid,
                         'usage_page': usage, 'dev_idx': di, 'handle': th,
+                        'change_host_feat_idx': res['feat_idx'],  # cache
                         'num_hosts': res['num_hosts'],
                         'current_host': res['current_host'],
                     })
@@ -361,20 +363,25 @@ def watch_loop(targets, cfg, stop_event, on_switch=None, on_status=None):
             if stuck is None:
                 stuck = now_ms
             elif now_ms - stuck >= cfg.hold_ms:
+                # Wake-burst em todos (best-effort, nao gating).
                 for t in targets:
                     if t['handle'] is None:
                         continue
-                    if not wake_burst(t['handle'], t['dev_idx']):
-                        _invalidate(t)
+                    wake_burst(t['handle'], t['dev_idx'])
+                # CHANGE_HOST sempre tentado: usa feat_idx cacheado da descoberta,
+                # estilo Solaar - no-reply write, nao espera ack.
                 results = []
                 for t in targets:
                     if t['handle'] is None:
                         results.append((t['name'], False, 'invalido'))
                         continue
                     try:
-                        ok, msg = set_host(t['handle'], t['dev_idx'], cfg.target_host_idx)
+                        ok, msg = set_host(
+                            t['handle'], t['dev_idx'], cfg.target_host_idx,
+                            feat_idx=t.get('change_host_feat_idx'),
+                        )
                         results.append((t['name'], ok, msg))
-                        if not ok and 'sem resposta' in msg:
+                        if not ok:
                             _invalidate(t)
                     except Exception as e:
                         results.append((t['name'], False, f'ERR({e})'))
