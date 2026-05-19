@@ -310,6 +310,65 @@ def virtual_screen_bounds():
     return x, y, x + w - 1, y + h - 1
 
 
+# ===== Notification listener (deteccao de F1/F2/F3 no teclado) =====
+
+def is_keyboard(target) -> bool:
+    """Heuristica simples por nome - K850/MX Keys/etc tem 'keyboard' no
+    product_string da Logitech."""
+    return 'keyboard' in target.get('name', '').lower()
+
+
+def parse_host_notification(report: bytes, change_host_feat_idx: int) -> int | None:
+    """Tenta extrair 'novo host' de uma notificacao HID++. Retorna o
+    host_idx (0-based) ou None se nao for evento de host change.
+
+    Heuristica conservadora: sw_id deve ser 0 (broadcast/notification),
+    e feat_idx tem que bater com CHANGE_HOST do device. O payload da
+    notificacao varia por firmware - byte 4 e o candidato mais comum
+    pro 'novo host'."""
+    if len(report) < 5:
+        return None
+    if report[0] not in (REPORT_SHORT, REPORT_LONG):
+        return None
+    if (report[3] & 0x0F) != 0:
+        return None  # nao e notificacao (sw_id deve ser 0)
+    if report[2] != change_host_feat_idx:
+        return None  # nao e do CHANGE_HOST feature
+    new_host = report[4]
+    if new_host > 2:
+        return None  # invalido - max 3 hosts
+    return new_host
+
+
+def poll_notifications(target):
+    """Read nao-bloqueante (5ms) procurando notificacoes HID++ no device.
+    Retorna list de bytes (raw reports nao identificados como response
+    da nossa SW_ID)."""
+    if target['handle'] is None:
+        return []
+    out = []
+    # Drena ate 5 reports por iteracao pra evitar acumulo
+    for _ in range(5):
+        try:
+            r = target['handle'].read(32, timeout_ms=2)
+        except Exception:
+            return out
+        if not r:
+            break
+        r = bytes(r)
+        if len(r) < 4:
+            continue
+        if r[0] not in (REPORT_SHORT, REPORT_LONG):
+            continue
+        # Filtra responses da nossa propria SW_ID - aquelas sao consumidas
+        # pelo hidpp_call quando ele e chamado. Aqui pegamos so notificacoes.
+        if (r[3] & 0x0F) == SW_ID:
+            continue
+        out.append(r)
+        _dbg(f"NOTIFICATION from {target['name']}", r)
+    return out
+
+
 # ===== Watch loop (API pra tray/app) =====
 
 def _invalidate(t):
@@ -336,10 +395,33 @@ def watch_loop(targets, cfg, stop_event, on_switch=None, on_status=None):
     armed = True  # so re-dispara apos cursor sair da borda
     last_reopen = {t['name']: 0.0 for t in targets}
     reopen_s = 2.0
+    last_fire_ts = 0.0  # quando rodamos CHANGE_HOST por edge - pra ignorar
+                        # notificacoes que sao consequencia da nossa propria acao
+    OURS_WINDOW = 3.0   # segundos apos edge-fire em que ignoramos notificacoes
+
+    # Classifica targets por tipo - so teclados originam mirroring
+    keyboards = [t for t in targets if is_keyboard(t)]
+    mice = [t for t in targets if not is_keyboard(t)]
 
     def status(msg):
         if on_status:
             on_status(msg)
+
+    def mirror_mice_to_host(new_host: int, source_name: str):
+        """Espelha o new_host em todos os mice. Chamado quando detectamos
+        que o usuario apertou F1/F2/F3 no teclado."""
+        nonlocal last_fire_ts
+        status(f"{source_name}: host -> {new_host} (manual), espelhando mice")
+        for m in mice:
+            if m['handle'] is None:
+                continue
+            try:
+                set_host(m['handle'], m['dev_idx'], new_host,
+                         feat_idx=m.get('change_host_feat_idx'))
+            except Exception:
+                pass
+            _invalidate(m)
+        last_fire_ts = time.time()
 
     while not stop_event.is_set():
         if cfg.paused:
@@ -358,6 +440,22 @@ def watch_loop(targets, cfg, stop_event, on_switch=None, on_status=None):
                     t['handle'] = h
                     status(f"{t['name']} reconectado")
                 last_reopen[t['name']] = now_s
+
+        # Listener de notificacoes HID++ em teclados (botao Easy-Switch fisico)
+        # Faz read nao-bloqueante de cada handle. Notificacoes vem espontaneamente
+        # quando o usuario aperta F1/F2/F3. Filtra responses da nossa SW_ID.
+        if now_s - last_fire_ts > OURS_WINDOW:  # nao reage a ecos do nosso fire
+            for kb in keyboards:
+                feat_idx = kb.get('change_host_feat_idx')
+                if feat_idx is None:
+                    continue
+                for report in poll_notifications(kb):
+                    new_host = parse_host_notification(report, feat_idx)
+                    if new_host is not None and new_host != kb.get('current_host'):
+                        mirror_mice_to_host(new_host, kb['name'])
+                        kb['current_host'] = new_host
+                        _invalidate(kb)  # teclado vai sair do radio - re-enumera depois
+                        break
 
         # Edge detection (virtual screen, abrange todos os monitores)
         xmin, _ymin, xmax, _ymax = virtual_screen_bounds()
@@ -397,6 +495,7 @@ def watch_loop(targets, cfg, stop_event, on_switch=None, on_status=None):
                     # vira zumbi mesmo o write tendo retornado sucesso. Invalida
                     # sempre - reopen pega quando o usuario trouxer de volta.
                     _invalidate(t)
+                last_fire_ts = now_s  # suprime notificacoes-eco do nosso fire
                 if on_switch:
                     on_switch(cfg.target_host_idx, results)
                 stuck = None
