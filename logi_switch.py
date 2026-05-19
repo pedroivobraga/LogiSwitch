@@ -391,11 +391,12 @@ def watch_loop(targets, cfg, stop_event, on_switch=None, on_status=None):
                             feat_idx=t.get('change_host_feat_idx'),
                         )
                         results.append((t['name'], ok, msg))
-                        if not ok:
-                            _invalidate(t)
                     except Exception as e:
                         results.append((t['name'], False, f'ERR({e})'))
-                        _invalidate(t)
+                    # Apos CHANGE_HOST o device sai do radio deste PC. O handle
+                    # vira zumbi mesmo o write tendo retornado sucesso. Invalida
+                    # sempre - reopen pega quando o usuario trouxer de volta.
+                    _invalidate(t)
                 if on_switch:
                     on_switch(cfg.target_host_idx, results)
                 stuck = None
