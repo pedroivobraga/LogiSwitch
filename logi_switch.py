@@ -120,22 +120,32 @@ def get_hosts_info(h, dev_idx):
 
 
 def set_host(h, dev_idx, host_idx, feat_idx=None):
-    """Dispara CHANGE_HOST.SetCurrentHost. Estilo Solaar: no_reply=True,
-    fire-and-forget. Se feat_idx for cacheado, evita o round-trip de
-    descoberta (que falha quando teclado esta ocupado entregando input)."""
+    """Dispara CHANGE_HOST.SetCurrentHost. Estilo Solaar: no_reply,
+    fire-and-forget. Envia SHORT + LONG porque devices BT tem
+    comportamento inconsistente sobre qual report aceita."""
     if feat_idx is None:
         feat_idx = get_feature_index(h, dev_idx, FEAT_CHANGE_HOST)
         if feat_idx is None:
             return False, 'CHANGE_HOST nao suportado / sem resposta'
-    # Write direto, sem esperar resposta (CHANGE_HOST nao garante reply -
-    # o device pode estar pulando de host quando o ack seria devido)
-    payload = bytes([REPORT_SHORT, dev_idx, feat_idx,
-                     (1 << 4) | SW_ID, host_idx, 0, 0])
+    fn_swid = (1 << 4) | SW_ID
+    short_pkt = bytes([REPORT_SHORT, dev_idx, feat_idx, fn_swid, host_idx, 0, 0])
+    long_pkt = bytes([REPORT_LONG, dev_idx, feat_idx, fn_swid, host_idx]
+                     + [0] * 15)
+    sent_any = False
+    err = None
     try:
-        h.write(payload)
-        return True, 'sent'
+        h.write(short_pkt)
+        sent_any = True
     except Exception as e:
-        return False, f'write error: {e}'
+        err = e
+    try:
+        h.write(long_pkt)
+        sent_any = True
+    except Exception as e:
+        err = err or e
+    if sent_any:
+        return True, 'sent'
+    return False, f'write error: {err}'
 
 
 def keep_awake(h, dev_idx):
