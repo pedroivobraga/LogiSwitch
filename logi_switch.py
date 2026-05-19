@@ -538,7 +538,15 @@ def watch_loop(targets, cfg, stop_event, on_switch=None, on_status=None):
                             _invalidate(kb)
                         keyboard_was_present[kb['name']] = False
 
-        # Edge detection (virtual screen, abrange todos os monitores)
+        # Edge detection (virtual screen, abrange todos os monitores).
+        # Pode ser desativado via config se o usuario prefere usar so o
+        # botao do teclado pra trocar (deteccao de saida cobre esse caso).
+        if not getattr(cfg, 'edge_trigger_enabled', True):
+            stuck = None
+            armed = True
+            time.sleep(0.01)
+            continue
+
         xmin, _ymin, xmax, _ymax = virtual_screen_bounds()
         x, _y = get_cursor()
         at_edge = (x >= xmax) if cfg.edge == 'right' else (x <= xmin)

@@ -32,6 +32,10 @@ class Config:
     # Cooldown apos disparar pra evitar repeticao.
     cooldown_ms: int = 800
 
+    # Trigger por borda da tela (cursor empurrado na lateral). Se False,
+    # so o gatilho de botão do teclado (deteccao de saida) atua.
+    edge_trigger_enabled: bool = True
+
     # Pausado? (controlado pelo tray)
     paused: bool = False
 

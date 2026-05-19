@@ -41,6 +41,14 @@ def open_settings(cfg: config_mod.Config, on_save):
     ttk.Separator(win, orient='horizontal').grid(row=row, column=0, columnspan=2, sticky='ew', pady=8)
     row += 1
 
+    edge_var = tk.BooleanVar(value=cfg.edge_trigger_enabled)
+    ttk.Checkbutton(
+        win,
+        text="Trocar quando cursor encostar na borda",
+        variable=edge_var,
+    ).grid(row=row, column=0, columnspan=2, sticky='w', padx=10, pady=4)
+    row += 1
+
     ttk.Label(win, text="Hold na borda (ms):").grid(row=row, column=0, sticky='w', **pad)
     hold_var = tk.IntVar(value=cfg.hold_ms)
     ttk.Spinbox(win, from_=20, to=2000, increment=10, textvariable=hold_var, width=8).grid(
@@ -68,6 +76,7 @@ def open_settings(cfg: config_mod.Config, on_save):
         cfg.other_side = side_var.get()
         cfg.hold_ms = hold_var.get()
         cfg.cooldown_ms = cd_var.get()
+        cfg.edge_trigger_enabled = edge_var.get()
         config_mod.save(cfg)
         on_save()
         status_lbl.config(text="Salvo. Hot-reload aplicado.", foreground='green')
