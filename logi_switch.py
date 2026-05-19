@@ -1,26 +1,21 @@
 """
 logi_switch.py - DIY Logitech Flow via HID++ CHANGE_HOST (0x1814)
 
-Setup (Windows):
-    pip install hidapi
-    Encerre Logi Options+ antes (servico tambem):
-        Get-Service *logi* | Set-Service -StartupType Disabled
-        Get-Service *logi* | Stop-Service -Force
-        Get-Process *logi* | Stop-Process -Force
+Dual use:
+  - Library: import discover_targets, watch_loop, etc. from app.py / tray
+  - CLI: run as script for manual testing
 
-Comandos:
+CLI commands:
     python logi_switch.py [--debug] list
     python logi_switch.py [--debug] scan [VID]
-    python logi_switch.py [--debug] probe --interface N
-    python logi_switch.py [--debug] devices --interface N
-    python logi_switch.py [--debug] info [dev_idx] --interface N
-    python logi_switch.py [--debug] switch <host_idx> [dev_idx] --interface N
+    python logi_switch.py [--debug] discover
     python logi_switch.py [--debug] watch --edge {left|right} --target H [--hold MS]
 """
 
 import ctypes
 import struct
 import sys
+import threading
 import time
 
 import hid
@@ -66,7 +61,7 @@ def open_device(path):
 
 def hidpp_call(h, dev_idx, feat_idx, func_id, params=b'',
                report=REPORT_SHORT, timeout_ms=600):
-    """Envia um HID++ e tenta ler a resposta. Tolera disconnect (BT trocou de PC)."""
+    """Envia HID++ e tenta ler resposta. Em BT, retry automatico em LONG."""
     for attempt_report in ([report] if report == REPORT_LONG else [REPORT_SHORT, REPORT_LONG]):
         size = 7 if attempt_report == REPORT_SHORT else 20
         payload = bytes([attempt_report, dev_idx, feat_idx,
@@ -81,7 +76,6 @@ def hidpp_call(h, dev_idx, feat_idx, func_id, params=b'',
         except Exception as e:
             _dbg("write error", str(e))
             return None
-
         deadline = time.time() + timeout_ms / 1000
         while time.time() < deadline:
             rem = max(1, int((deadline - time.time()) * 1000))
@@ -108,8 +102,7 @@ def hidpp_call(h, dev_idx, feat_idx, func_id, params=b'',
 
 
 def get_feature_index(h, dev_idx, feature_id):
-    params = struct.pack(">H", feature_id)
-    resp = hidpp_call(h, dev_idx, 0x00, 0, params)
+    resp = hidpp_call(h, dev_idx, 0x00, 0, struct.pack(">H", feature_id))
     if not resp or resp[2] in (ERR_HIDPP10, ERR_HIDPP20):
         return None
     idx = resp[4]
@@ -139,7 +132,6 @@ def set_host(h, dev_idx, host_idx):
 
 
 def keep_awake(h, dev_idx):
-    """Retorna True se write/read OK, False se device parece morto."""
     try:
         payload = bytes([REPORT_SHORT, dev_idx, 0x00, (1 << 4) | SW_ID, 0, 0, 0])
         h.write(payload)
@@ -159,12 +151,104 @@ def wake_burst(h, dev_idx, attempts=3):
     return ok
 
 
-# ===== Edge detection (Windows) =====
+def find_fresh_path(product_id, usage_page):
+    for d in hid.enumerate(LOGI_VID, product_id):
+        if d.get('usage_page') == usage_page:
+            return d['path']
+    return None
+
+
+def reopen_handle(product_id, usage_page, dev_idx):
+    """Re-enumera + valida com probe. Retorna (handle, path) ou (None, None)."""
+    path = find_fresh_path(product_id, usage_page)
+    if not path:
+        return None, None
+    try:
+        h = hid.device()
+        h.open_path(path)
+        h.set_nonblocking(0)
+    except Exception as e:
+        _dbg("reopen open_path error", str(e))
+        return None, None
+    resp = hidpp_call(h, dev_idx, 0x00, 1, b'\x00\x00\x00', timeout_ms=300)
+    if resp is None:
+        try: h.close()
+        except: pass
+        return None, None
+    return h, path
+
+
+# ===== Discovery =====
+
+def discover_targets(verbose=False):
+    """Lista de targets: dicts com name, product_id, usage_page, dev_idx, handle.
+    BT (0xFF43): cada interface = 1 target dev_idx=0x00.
+    USB receiver (0xFF00): scan dev_idx 1..6."""
+    targets = []
+    for info in find_hidpp_interfaces():
+        try:
+            h = open_device(info['path'])
+        except Exception as e:
+            if verbose: print(f"Falha abrindo {info.get('product_string','?')}: {e}")
+            continue
+
+        usage = info.get('usage_page')
+        pid = info['product_id']
+        product = info.get('product_string', f"PID_{pid:04X}")
+
+        if usage == 0xFF43:
+            res = get_hosts_info(h, 0x00)
+            if res:
+                targets.append({
+                    'name': product, 'product_id': pid, 'usage_page': usage,
+                    'dev_idx': 0x00, 'handle': h,
+                    'num_hosts': res['num_hosts'],
+                    'current_host': res['current_host'],
+                })
+                if verbose:
+                    print(f"  + {product} (BT, hosts={res['num_hosts']}, current={res['current_host']})")
+            else:
+                if verbose: print(f"  - {product} (BT): sem resposta")
+                try: h.close()
+                except: pass
+
+        elif usage == 0xFF00:
+            found = False
+            for di in range(1, 7):
+                res = get_hosts_info(h, di)
+                if res:
+                    found = True
+                    try:
+                        th = open_device(info['path'])
+                    except Exception:
+                        continue
+                    targets.append({
+                        'name': f"{product}/dev{di}", 'product_id': pid,
+                        'usage_page': usage, 'dev_idx': di, 'handle': th,
+                        'num_hosts': res['num_hosts'],
+                        'current_host': res['current_host'],
+                    })
+                    if verbose:
+                        print(f"  + {product}/dev{di} (USB, hosts={res['num_hosts']}, current={res['current_host']})")
+            try: h.close()
+            except: pass
+            if not found and verbose:
+                print(f"  - {product} (USB): sem pareados")
+
+    return targets
+
+
+# ===== Multi-monitor virtual screen =====
 
 if sys.platform == 'win32':
     _user32 = ctypes.windll.user32
 else:
     _user32 = None
+
+SM_XVIRTUALSCREEN = 76
+SM_YVIRTUALSCREEN = 77
+SM_CXVIRTUALSCREEN = 78
+SM_CYVIRTUALSCREEN = 79
 
 
 class POINT(ctypes.Structure):
@@ -177,71 +261,53 @@ def get_cursor():
     return p.x, p.y
 
 
-def screen_size():
-    return _user32.GetSystemMetrics(0), _user32.GetSystemMetrics(1)
+def virtual_screen_bounds():
+    """(xmin, ymin, xmax, ymax) cobrindo TODOS os monitores."""
+    x = _user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
+    y = _user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
+    w = _user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
+    h = _user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
+    return x, y, x + w - 1, y + h - 1
 
 
-def find_fresh_path(product_id, usage_page):
-    """Re-enumera HIDs e devolve o path atual deste device (post-reconnect
-    pode ter mudado de path/Col)."""
-    for d in hid.enumerate(LOGI_VID, product_id):
-        if d.get('usage_page') == usage_page:
-            return d['path']
-    return None
+# ===== Watch loop (API pra tray/app) =====
 
-
-def reopen_handle(product_id, usage_page, dev_idx):
-    """Re-enumera e abre fresh. Valida o handle com um probe leve.
-    Retorna (handle, path) ou (None, None)."""
-    path = find_fresh_path(product_id, usage_page)
-    if not path:
-        _dbg("reopen", f"path nao encontrado pra PID 0x{product_id:04X}")
-        return None, None
-    try:
-        h = hid.device()
-        h.open_path(path)
-        h.set_nonblocking(0)
-    except Exception as e:
-        _dbg("reopen open_path error", str(e))
-        return None, None
-    # Validacao: tenta um GetProtocolVersion - se nao responder, handle e zumbi
-    resp = hidpp_call(h, dev_idx, 0x00, 1, b'\x00\x00\x00', timeout_ms=300)
-    if resp is None:
-        _dbg("reopen", "handle aberto mas nao responde probe - fechando")
+def _invalidate(t):
+    if t.get('handle') is not None:
         try:
-            h.close()
+            t['handle'].close()
         except Exception:
             pass
-        return None, None
-    return h, path
+    t['handle'] = None
 
 
-def _invalidate(d):
-    if d.get('handle') is not None:
-        try:
-            d['handle'].close()
-        except Exception:
-            pass
-    d['handle'] = None
+def watch_loop(targets, cfg, stop_event, on_switch=None, on_status=None):
+    """Loop principal. Le cfg dinamicamente (hot reload de edge/target/etc).
 
-
-def watch_edge(targets, target_host, edge='right',
-               hold_ms=80, cooldown_ms=800, keepalive_s=3.0,
-               reopen_s=2.0):
-    """targets: lista de dicts {'name', 'product_id', 'usage_page', 'dev_idx', 'handle'}.
-    Cada target tem seu proprio dev_idx (0x00 pra BT, 1..6 pra receptor USB)."""
+    cfg precisa expor: edge, target_host_idx, hold_ms, cooldown_ms,
+    keepalive_s, paused.
+    stop_event: threading.Event - encerra quando setado.
+    on_switch(target_host, results): callback apos cada disparo.
+    on_status(msg): callback opcional pra status (reconectado etc).
+    """
     if _user32 is None:
-        raise RuntimeError("watch_edge requer Windows")
-    w, _ = screen_size()
-    names = ", ".join(f"{t['name']}(di=0x{t['dev_idx']:02X})" for t in targets)
-    print(f"Vigiando borda {edge} (tela={w}px). Hold {hold_ms}ms dispara.")
-    print(f"Targets: {names}. Keep-alive a cada {keepalive_s}s. Ctrl+C pra parar.")
+        raise RuntimeError("watch_loop requer Windows")
 
     stuck = None
-    last_keepalive = 0
-    last_reopen = {t['name']: 0 for t in targets}
+    last_keepalive = 0.0
+    last_reopen = {t['name']: 0.0 for t in targets}
+    reopen_s = 2.0
 
-    while True:
+    def status(msg):
+        if on_status:
+            on_status(msg)
+
+    while not stop_event.is_set():
+        if cfg.paused:
+            time.sleep(0.1)
+            stuck = None
+            continue
+
         now_s = time.time()
 
         # Reabre handles invalidos
@@ -250,27 +316,28 @@ def watch_edge(targets, target_host, edge='right',
                 h, _ = reopen_handle(t['product_id'], t['usage_page'], t['dev_idx'])
                 if h is not None:
                     t['handle'] = h
-                    print(f"  [{time.strftime('%H:%M:%S')}] {t['name']} reconectado")
+                    status(f"{t['name']} reconectado")
                 last_reopen[t['name']] = now_s
 
         # Keep-alive
-        if now_s - last_keepalive > keepalive_s:
+        if now_s - last_keepalive > cfg.keepalive_s:
             for t in targets:
                 if t['handle'] is not None:
                     if not keep_awake(t['handle'], t['dev_idx']):
                         _invalidate(t)
-                        print(f"  [{time.strftime('%H:%M:%S')}] {t['name']} keep-alive falhou")
+                        status(f"{t['name']} keep-alive falhou")
             last_keepalive = now_s
 
-        # Edge detection
+        # Edge detection (virtual screen, abrange todos os monitores)
+        xmin, _ymin, xmax, _ymax = virtual_screen_bounds()
         x, _y = get_cursor()
-        at_edge = (x >= w - 1) if edge == 'right' else (x <= 0)
+        at_edge = (x >= xmax) if cfg.edge == 'right' else (x <= xmin)
+
         if at_edge:
             now_ms = now_s * 1000
             if stuck is None:
                 stuck = now_ms
-            elif now_ms - stuck >= hold_ms:
-                ts = time.strftime('%H:%M:%S')
+            elif now_ms - stuck >= cfg.hold_ms:
                 for t in targets:
                     if t['handle'] is None:
                         continue
@@ -279,86 +346,30 @@ def watch_edge(targets, target_host, edge='right',
                 results = []
                 for t in targets:
                     if t['handle'] is None:
-                        results.append(f"{t['name']}=invalido")
+                        results.append((t['name'], False, 'invalido'))
                         continue
                     try:
-                        ok, msg = set_host(t['handle'], t['dev_idx'], target_host)
-                        results.append(f"{t['name']}={msg}")
+                        ok, msg = set_host(t['handle'], t['dev_idx'], cfg.target_host_idx)
+                        results.append((t['name'], ok, msg))
                         if not ok and 'sem resposta' in msg:
                             _invalidate(t)
                     except Exception as e:
-                        results.append(f"{t['name']}=ERR({e})")
+                        results.append((t['name'], False, f'ERR({e})'))
                         _invalidate(t)
-                print(f"[{ts}] -> host {target_host}: {' | '.join(results)}")
+                if on_switch:
+                    on_switch(cfg.target_host_idx, results)
                 stuck = None
-                time.sleep(cooldown_ms / 1000)
+                stop_event.wait(cfg.cooldown_ms / 1000)
         else:
             stuck = None
+
         time.sleep(0.01)
 
 
-def discover_targets():
-    """Acha automaticamente todos os devices Logitech que suportam CHANGE_HOST.
-    BT: cada interface 0xFF43 vira 1 target com dev_idx=0x00.
-    USB receiver: interface 0xFF00, scan dev_idx 1..6, cada pareado vira 1 target."""
-    targets = []
-    for info in find_hidpp_interfaces():
-        try:
-            h = open_device(info['path'])
-        except Exception as e:
-            print(f"Falha abrindo {info.get('product_string','?')}: {e}")
-            continue
-
-        usage = info.get('usage_page')
-        pid = info['product_id']
-        product = info.get('product_string', f"PID_{pid:04X}")
-
-        if usage == 0xFF43:
-            # BT direto: device unico, dev_idx=0x00
-            res = get_hosts_info(h, 0x00)
-            if res:
-                targets.append({
-                    'name': product,
-                    'product_id': pid,
-                    'usage_page': usage,
-                    'dev_idx': 0x00,
-                    'handle': h,
-                })
-                print(f"  + {product} (BT, dev_idx=0x00, hosts={res['num_hosts']}, current={res['current_host']})")
-            else:
-                print(f"  - {product} (BT): nao respondeu HID++")
-                try: h.close()
-                except: pass
-
-        elif usage == 0xFF00:
-            # Receptor USB: scan dev_idx 1..6, handle separado por device
-            found_any = False
-            for di in range(1, 7):
-                res = get_hosts_info(h, di)
-                if res:
-                    found_any = True
-                    # Abre handle proprio pra este target (cross-handle e seguro:
-                    # HID no Windows duplica reports pra todos os opens)
-                    try:
-                        th = open_device(info['path'])
-                    except Exception as e:
-                        print(f"    falha abrindo handle extra: {e}")
-                        continue
-                    targets.append({
-                        'name': f"{product}/dev{di}",
-                        'product_id': pid,
-                        'usage_page': usage,
-                        'dev_idx': di,
-                        'handle': th,
-                    })
-                    print(f"  + {product}/dev{di} (USB, dev_idx={di}, hosts={res['num_hosts']}, current={res['current_host']})")
-            # Handle de scan original nao e mais usado
-            try: h.close()
-            except: pass
-            if not found_any:
-                print(f"  - {product} (USB): nenhum device pareado responde")
-
-    return targets
+def close_targets(targets):
+    """Fecha todos os handles - chamar antes de sair."""
+    for t in targets:
+        _invalidate(t)
 
 
 # ===== CLI =====
@@ -374,6 +385,45 @@ def _parse_kv(argv, defaults):
     return out
 
 
+def _cli_watch(argv):
+    from dataclasses import dataclass
+
+    opts = _parse_kv(argv, {'edge': 'right', 'target': 1, 'hold': 80})
+
+    @dataclass
+    class CliCfg:
+        edge: str = opts['edge']
+        target_host_idx: int = opts['target']
+        hold_ms: int = opts['hold']
+        cooldown_ms: int = 800
+        keepalive_s: float = 3.0
+        paused: bool = False
+
+    print("Descobrindo devices Logitech...")
+    targets = discover_targets(verbose=True)
+    if not targets:
+        print("Nenhum target encontrado.")
+        return
+
+    print(f"Vigiando {opts['edge']}, target host {opts['target']}, hold {opts['hold']}ms. Ctrl+C pra parar.")
+    stop = threading.Event()
+
+    def cb(host, results):
+        ts = time.strftime('%H:%M:%S')
+        parts = [f"{name}={msg}" for name, _ok, msg in results]
+        print(f"[{ts}] -> host {host}: {' | '.join(parts)}")
+
+    def status(msg):
+        print(f"  [{time.strftime('%H:%M:%S')}] {msg}")
+
+    try:
+        watch_loop(targets, CliCfg(), stop, on_switch=cb, on_status=status)
+    except KeyboardInterrupt:
+        stop.set()
+    finally:
+        close_targets(targets)
+
+
 def main():
     global DEBUG
     argv = sys.argv[1:]
@@ -384,116 +434,27 @@ def main():
         print(__doc__); return
 
     cmd = argv[0]
-    sys.argv = [sys.argv[0], cmd] + argv[1:]
+    rest = argv[1:]
 
     if cmd == 'list':
-        ifs = find_hidpp_interfaces()
-        if not ifs:
-            print("Nenhuma interface HID++ Logitech encontrada.")
-            return
-        for i, d in enumerate(ifs):
+        for i, d in enumerate(find_hidpp_interfaces()):
             print(f"[{i}] PID=0x{d['product_id']:04X} {d.get('product_string','?')} "
-                  f"iface={d.get('interface_number')} "
-                  f"usage_page=0x{d.get('usage_page',0):04X} "
-                  f"path={d['path']!r}")
+                  f"usage_page=0x{d.get('usage_page',0):04X}")
         return
 
     if cmd == 'scan':
-        vid_filter = int(sys.argv[2], 0) if len(sys.argv) > 2 else 0
-        for d in hid.enumerate(vid_filter, 0):
+        vid = int(rest[0], 0) if rest else 0
+        for d in hid.enumerate(vid, 0):
             print(f"VID=0x{d['vendor_id']:04X} PID=0x{d['product_id']:04X} "
-                  f"'{d.get('product_string','?')}' mfr='{d.get('manufacturer_string','?')}' "
-                  f"iface={d.get('interface_number')} "
-                  f"usage_page=0x{d.get('usage_page',0):04X} "
-                  f"usage=0x{d.get('usage',0):04X}")
+                  f"'{d.get('product_string','?')}' usage_page=0x{d.get('usage_page',0):04X}")
         return
 
-    ifs = find_hidpp_interfaces()
-    if not ifs:
-        print("Nenhuma interface HID++ Logitech encontrada.")
+    if cmd == 'discover':
+        discover_targets(verbose=True)
         return
-
-    def default_dev_idx(iface_info):
-        return 0x00 if iface_info.get('usage_page') == 0xFF43 else 1
-
-    if cmd == 'probe':
-        iface_n = 0
-        rest = list(sys.argv[2:])
-        if '--interface' in rest:
-            i = rest.index('--interface')
-            iface_n = int(rest[i + 1])
-        info = ifs[iface_n]
-        print(f"Probing: {info.get('product_string','?')} (usage_page=0x{info['usage_page']:04X})")
-        h = open_device(info['path'])
-        for di in [0xFF, 0x00, 0x01]:
-            print(f"\n-- dev_idx=0x{di:02X} --")
-            print("  GetProtocolVersion (ROOT.func1):")
-            r = hidpp_call(h, di, 0x00, 1, b'\x00\x00\x00')
-            print(f"    -> {' '.join(f'{b:02X}' for b in r) if r else 'sem resposta'}")
-            print("  GetFeature(CHANGE_HOST=0x1814):")
-            r = hidpp_call(h, di, 0x00, 0, b'\x18\x14')
-            if r:
-                print(f"    -> {' '.join(f'{b:02X}' for b in r)}")
-                if r[2] not in (ERR_HIDPP10, ERR_HIDPP20) and r[4] != 0:
-                    print(f"    *** CHANGE_HOST em feat_idx=0x{r[4]:02X} ***")
-            else:
-                print("    -> sem resposta")
-        return
-
-    if cmd in ('devices', 'info', 'switch'):
-        iface_n = 0
-        rest = list(sys.argv[2:])
-        if '--interface' in rest:
-            i = rest.index('--interface')
-            iface_n = int(rest[i + 1])
-            del rest[i:i + 2]
-
-        info = ifs[iface_n]
-        print(f"Usando: PID=0x{info['product_id']:04X} {info.get('product_string','?')} "
-              f"(usage_page=0x{info['usage_page']:04X})")
-        h = open_device(info['path'])
-        default_di = default_dev_idx(info)
-
-        if cmd == 'devices':
-            candidates = [0x00, 0xFF, 0x01] if default_di == 0x00 else list(range(1, 7)) + [0xFF]
-            any_found = False
-            for di in candidates:
-                res = get_hosts_info(h, di)
-                if res:
-                    any_found = True
-                    print(f"  dev_idx=0x{di:02X}: feat_idx=0x{res['feat_idx']:02X} "
-                          f"hosts={res['num_hosts']} current={res['current_host']}")
-            if not any_found:
-                print("Nenhum device respondeu CHANGE_HOST.")
-            return
-
-        if cmd == 'info':
-            di = int(rest[0], 0) if rest else default_di
-            res = get_hosts_info(h, di)
-            print(res if res else f"dev_idx=0x{di:02X}: sem resposta")
-            return
-
-        if cmd == 'switch':
-            host = int(rest[0])
-            di = int(rest[1], 0) if len(rest) > 1 else default_di
-            wake_burst(h, di, attempts=5)
-            ok, msg = set_host(h, di, host)
-            print(f"dev_idx=0x{di:02X} -> host {host}: {msg}")
-            return
 
     if cmd == 'watch':
-        opts = _parse_kv(sys.argv[2:],
-                         {'edge': 'right', 'target': 1, 'hold': 80})
-        print("Descobrindo devices Logitech compativeis...")
-        targets = discover_targets()
-        if not targets:
-            print("Nenhum target encontrado (BT direto ou receptor USB).")
-            return
-        try:
-            watch_edge(targets, opts['target'],
-                       edge=opts['edge'], hold_ms=opts['hold'])
-        except KeyboardInterrupt:
-            print()
+        _cli_watch(rest)
         return
 
     print(f"Comando desconhecido: {cmd}")

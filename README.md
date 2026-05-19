@@ -41,36 +41,44 @@ even when the two PCs cannot reach each other on the network.
 
 ## Usage
 
-### List interfaces
+### Tray app (recommended)
+
 ```powershell
-python logi_switch.py list
+pythonw app.py
 ```
 
-### Auto-discover and watch screen edge
-```powershell
-# On the PC to the LEFT, watching the right edge, switching to host 0:
-python logi_switch.py watch --edge right --target 0 --hold 80
+A system tray icon appears with a context menu:
+- **Pausar / Retomar** — temporarily disable edge detection
+- **Configuracoes...** — open the settings window (channel mapping, hold ms, etc.)
+- **Re-detectar devices** — re-run discovery (use after pairing a new device)
+- **Sair** — quit
 
-# On the PC to the RIGHT, watching the left edge, switching to host 1:
-python logi_switch.py watch --edge left --target 1 --hold 80
+Configuration is stored in `%APPDATA%\LogiSwitch\config.json` and applied
+on save with hot-reload (no restart). Multi-monitor setups use the full
+virtual screen bounds, so the edge is the outermost pixel across all
+displays.
+
+### CLI (no tray)
+
+```powershell
+python logi_switch.py list                                          # list interfaces
+python logi_switch.py scan [VID]                                    # list raw HID devices
+python logi_switch.py discover                                      # show CHANGE_HOST-capable targets
+python logi_switch.py watch --edge right --target 0 --hold 80       # blocking watch loop
 ```
 
 `--target` is 0-based: `0` = Easy-Switch channel 1, `1` = channel 2, `2` = channel 3.
 
-The watch mode auto-discovers all Logitech HID++ devices visible to this
-PC (BT-paired devices each become a target; devices behind a USB receiver
-are enumerated via `dev_idx` 1..6).
-
-### Manual commands
-```powershell
-python logi_switch.py scan [VID]              # list all HID devices (or filtered by VID)
-python logi_switch.py probe --interface N     # probe HID++ on interface N
-python logi_switch.py devices --interface N   # show CHANGE_HOST-capable devices
-python logi_switch.py info [dev_idx] --interface N
-python logi_switch.py switch <host> [dev_idx] --interface N
-```
-
 Add `--debug` before the command to see raw HID++ TX/RX bytes.
+
+## Project layout
+
+```
+logi_switch.py    HID++ core + CLI
+config.py         dataclass + JSON persistence (%APPDATA%\LogiSwitch\config.json)
+settings_ui.py    tkinter settings window
+app.py            pystray tray app, watch coordinator
+```
 
 ## Caveats
 
