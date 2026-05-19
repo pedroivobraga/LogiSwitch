@@ -196,10 +196,10 @@ def reopen_handle(product_id, usage_page, dev_idx):
 # ===== Discovery =====
 
 def _probe_with_retry(h, dev_idx, attempts=3, delay_s=0.2):
-    """Probe agressivo - acorda e tenta varias vezes. Util pra descoberta
+    """Wake + probe ate get_hosts_info responder. Util pra descoberta
     de devices BT que podem estar ocupados entregando input."""
     for i in range(attempts):
-        wake_burst(h, dev_idx, attempts=4, gap_ms=40)
+        wake_burst(h, dev_idx)  # internamente probe-first + burst se preciso
         res = get_hosts_info(h, dev_idx)
         if res:
             return res
