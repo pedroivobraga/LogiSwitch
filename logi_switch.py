@@ -188,6 +188,19 @@ def reopen_handle(product_id, usage_page, dev_idx):
 
 # ===== Discovery =====
 
+def _probe_with_retry(h, dev_idx, attempts=3, delay_s=0.2):
+    """Probe agressivo - acorda e tenta varias vezes. Util pra descoberta
+    de devices BT que podem estar ocupados entregando input."""
+    for i in range(attempts):
+        wake_burst(h, dev_idx, attempts=4, gap_ms=40)
+        res = get_hosts_info(h, dev_idx)
+        if res:
+            return res
+        if i < attempts - 1:
+            time.sleep(delay_s)
+    return None
+
+
 def discover_targets(verbose=False):
     """Lista de targets: dicts com name, product_id, usage_page, dev_idx, handle.
     BT (0xFF43): cada interface = 1 target dev_idx=0x00.
@@ -205,7 +218,7 @@ def discover_targets(verbose=False):
         product = info.get('product_string', f"PID_{pid:04X}")
 
         if usage == 0xFF43:
-            res = get_hosts_info(h, 0x00)
+            res = _probe_with_retry(h, 0x00)
             if res:
                 targets.append({
                     'name': product, 'product_id': pid, 'usage_page': usage,
@@ -223,7 +236,7 @@ def discover_targets(verbose=False):
         elif usage == 0xFF00:
             found = False
             for di in range(1, 7):
-                res = get_hosts_info(h, di)
+                res = _probe_with_retry(h, di, attempts=2, delay_s=0.15)
                 if res:
                     found = True
                     try:
@@ -302,6 +315,7 @@ def watch_loop(targets, cfg, stop_event, on_switch=None, on_status=None):
         raise RuntimeError("watch_loop requer Windows")
 
     stuck = None
+    armed = True  # so re-dispara apos cursor sair da borda
     last_keepalive = 0.0
     last_reopen = {t['name']: 0.0 for t in targets}
     reopen_s = 2.0
@@ -314,6 +328,7 @@ def watch_loop(targets, cfg, stop_event, on_switch=None, on_status=None):
         if cfg.paused:
             time.sleep(0.1)
             stuck = None
+            armed = True
             continue
 
         now_s = time.time()
@@ -342,6 +357,10 @@ def watch_loop(targets, cfg, stop_event, on_switch=None, on_status=None):
         at_edge = (x >= xmax) if cfg.edge == 'right' else (x <= xmin)
 
         if at_edge:
+            if not armed:
+                # Ja disparamos nesta visita a borda; espera sair pra rearmar
+                time.sleep(0.01)
+                continue
             now_ms = now_s * 1000
             if stuck is None:
                 stuck = now_ms
@@ -367,9 +386,11 @@ def watch_loop(targets, cfg, stop_event, on_switch=None, on_status=None):
                 if on_switch:
                     on_switch(cfg.target_host_idx, results)
                 stuck = None
+                armed = False  # bloqueia re-disparo ate sair da borda
                 stop_event.wait(cfg.cooldown_ms / 1000)
         else:
             stuck = None
+            armed = True
 
         time.sleep(0.01)
 
