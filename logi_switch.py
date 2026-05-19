@@ -28,7 +28,10 @@ REPORT_LONG = 0x11
 SW_ID = 0x09
 
 FEAT_ROOT = 0x0000
+FEAT_FEATURE_SET = 0x0001
 FEAT_CHANGE_HOST = 0x1814
+FEAT_HOSTS_INFO = 0x1815
+FEAT_WIRELESS_DEVICE_STATUS = 0x1D4B
 
 ERR_HIDPP10 = 0x8F
 ERR_HIDPP20 = 0xFF
@@ -237,15 +240,24 @@ def discover_targets(verbose=False):
         if usage == 0xFF43:
             res = _probe_with_retry(h, 0x00)
             if res:
-                targets.append({
+                target = {
                     'name': product, 'product_id': pid, 'usage_page': usage,
                     'dev_idx': 0x00, 'handle': h,
                     'change_host_feat_idx': res['feat_idx'],  # cache - evita lookup no switch
                     'num_hosts': res['num_hosts'],
                     'current_host': res['current_host'],
-                })
+                }
+                # Pra teclados: tenta habilitar notificacao de host change
+                if 'keyboard' in product.lower():
+                    target.update(enable_host_notifications(target))
+                targets.append(target)
                 if verbose:
-                    print(f"  + {product} (BT, hosts={res['num_hosts']}, current={res['current_host']})")
+                    extra = ''
+                    if 'hosts_info_feat_idx' in target:
+                        extra += f" HOSTS_INFO=0x{target['hosts_info_feat_idx']:02X}"
+                    if 'wireless_status_feat_idx' in target:
+                        extra += f" WS=0x{target['wireless_status_feat_idx']:02X}"
+                    print(f"  + {product} (BT, hosts={res['num_hosts']}, current={res['current_host']}){extra}")
             else:
                 if verbose: print(f"  - {product} (BT): sem resposta")
                 try: h.close()
@@ -310,6 +322,52 @@ def virtual_screen_bounds():
     return x, y, x + w - 1, y + h - 1
 
 
+# ===== Subscription pra notificacoes de host change =====
+
+def enable_host_notifications(target):
+    """Tenta varias estrategias pra fazer o device emitir notificacao quando
+    o usuario aperta F1/F2/F3. Retorna dict com 'hosts_info_feat_idx' e
+    'wireless_status_feat_idx' se descobertos."""
+    h = target['handle']
+    if h is None:
+        return {}
+    di = target['dev_idx']
+    info = {}
+
+    # Estrategia 1: probar HOSTS_INFO (0x1815). Solaar usa essa feature
+    # pra get_host_friendly_name; algumas implementacoes emitem evento na
+    # primeira chamada.
+    hi_idx = get_feature_index(h, di, FEAT_HOSTS_INFO)
+    if hi_idx:
+        info['hosts_info_feat_idx'] = hi_idx
+        _dbg(f"  enable_notifications {target['name']}",
+             f"HOSTS_INFO disponivel em feat_idx=0x{hi_idx:02X}")
+        # Trigger a get para potencialmente "ativar" eventos
+        hidpp_call(h, di, hi_idx, 0, b'', timeout_ms=200)
+
+    # Estrategia 2: WIRELESS_DEVICE_STATUS (0x1D4B). Emite eventos quando
+    # status do device muda - incluindo troca de host em alguns firmwares.
+    ws_idx = get_feature_index(h, di, FEAT_WIRELESS_DEVICE_STATUS)
+    if ws_idx:
+        info['wireless_status_feat_idx'] = ws_idx
+        _dbg(f"  enable_notifications {target['name']}",
+             f"WIRELESS_DEVICE_STATUS disponivel em feat_idx=0x{ws_idx:02X}")
+
+    # Estrategia 3: HID++ 1.0 - habilita 'wireless notifications' via
+    # register 0x00 (set_register). Pode nao funcionar em BT direto mas
+    # custa pouco tentar. Bit 0 = 'wireless notifications'.
+    try:
+        # Set register 0x00 = 00 10 00 (enable HID++ wireless notifications)
+        pkt = bytes([REPORT_SHORT, di, 0x80, 0x00, 0x00, 0x10, 0x00])
+        h.write(pkt)
+        _dbg(f"  enable_notifications {target['name']}",
+             "HID++1.0 set_register 0x00 = 00 10 00 enviado")
+    except Exception:
+        pass
+
+    return info
+
+
 # ===== Notification listener (deteccao de F1/F2/F3 no teclado) =====
 
 def is_keyboard(target) -> bool:
@@ -318,26 +376,25 @@ def is_keyboard(target) -> bool:
     return 'keyboard' in target.get('name', '').lower()
 
 
-def parse_host_notification(report: bytes, change_host_feat_idx: int) -> int | None:
+def parse_host_notification(report: bytes, accepted_feat_idxs: set) -> int | None:
     """Tenta extrair 'novo host' de uma notificacao HID++. Retorna o
     host_idx (0-based) ou None se nao for evento de host change.
 
-    Heuristica conservadora: sw_id deve ser 0 (broadcast/notification),
-    e feat_idx tem que bater com CHANGE_HOST do device. O payload da
-    notificacao varia por firmware - byte 4 e o candidato mais comum
-    pro 'novo host'."""
+    accepted_feat_idxs: set de feature indices que podem emitir host change
+    (CHANGE_HOST e HOSTS_INFO, valores cacheados na descoberta)."""
     if len(report) < 5:
         return None
     if report[0] not in (REPORT_SHORT, REPORT_LONG):
         return None
     if (report[3] & 0x0F) != 0:
         return None  # nao e notificacao (sw_id deve ser 0)
-    if report[2] != change_host_feat_idx:
-        return None  # nao e do CHANGE_HOST feature
-    new_host = report[4]
-    if new_host > 2:
-        return None  # invalido - max 3 hosts
-    return new_host
+    if report[2] not in accepted_feat_idxs:
+        return None
+    # Byte 4 e o candidato mais comum pro novo host. Se inválido, tenta byte 5.
+    for cand in (report[4], report[5]):
+        if cand <= 2:
+            return cand
+    return None
 
 
 def poll_notifications(target):
@@ -446,11 +503,17 @@ def watch_loop(targets, cfg, stop_event, on_switch=None, on_status=None):
         # quando o usuario aperta F1/F2/F3. Filtra responses da nossa SW_ID.
         if now_s - last_fire_ts > OURS_WINDOW:  # nao reage a ecos do nosso fire
             for kb in keyboards:
-                feat_idx = kb.get('change_host_feat_idx')
-                if feat_idx is None:
+                # Aceita notificacoes de varios features que podem indicar host change
+                accepted = set()
+                for k in ('change_host_feat_idx', 'hosts_info_feat_idx',
+                          'wireless_status_feat_idx'):
+                    fi = kb.get(k)
+                    if fi is not None:
+                        accepted.add(fi)
+                if not accepted:
                     continue
                 for report in poll_notifications(kb):
-                    new_host = parse_host_notification(report, feat_idx)
+                    new_host = parse_host_notification(report, accepted)
                     if new_host is not None and new_host != kb.get('current_host'):
                         mirror_mice_to_host(new_host, kb['name'])
                         kb['current_host'] = new_host
