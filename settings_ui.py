@@ -53,12 +53,6 @@ def open_settings(cfg: config_mod.Config, on_save):
         row=row, column=1, sticky='w', **pad)
     row += 1
 
-    ttk.Label(win, text="Keep-alive (s):").grid(row=row, column=0, sticky='w', **pad)
-    ka_var = tk.DoubleVar(value=cfg.keepalive_s)
-    ttk.Spinbox(win, from_=1.0, to=30.0, increment=0.5, textvariable=ka_var, width=8).grid(
-        row=row, column=1, sticky='w', **pad)
-    row += 1
-
     status_lbl = ttk.Label(win, text="", foreground='gray')
     status_lbl.grid(row=row, column=0, columnspan=2, sticky='w', padx=10)
     row += 1
@@ -74,7 +68,6 @@ def open_settings(cfg: config_mod.Config, on_save):
         cfg.other_side = side_var.get()
         cfg.hold_ms = hold_var.get()
         cfg.cooldown_ms = cd_var.get()
-        cfg.keepalive_s = ka_var.get()
         config_mod.save(cfg)
         on_save()
         status_lbl.config(text="Salvo. Hot-reload aplicado.", foreground='green')

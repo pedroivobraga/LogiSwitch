@@ -149,17 +149,21 @@ def keep_awake(h, dev_idx):
         return False
 
 
-def wake_burst(h, dev_idx, attempts=8, gap_ms=50):
-    """Probe rapido primeiro: se ja responde, sai em ~10-80ms. Se nao,
-    cai pro burst longo pra acordar radio BT em deep sleep (~480ms total)."""
-    # Caso comum: keep-alive mantem device warm → probe responde rapido
+def wake_burst(h, dev_idx, max_rounds=3, pings_per_round=8, gap_ms=50):
+    """Probe rapido (~80ms) confirma se ja awake. Se nao, faz rounds de
+    burst (~400ms cada) + re-probe ate confirmar. Total max: ~1.5s pra
+    deep sleep. Devolve True se confirmou awake, False se desistiu."""
+    # 1. Probe inicial (caso awake/shallow sleep)
     if hidpp_call(h, dev_idx, 0x00, 1, b'\x00\x00\x00', timeout_ms=40) is not None:
         return True
-    # Caso deep sleep: burst pra acordar o radio
-    for _ in range(attempts):
-        keep_awake(h, dev_idx)
-        time.sleep(gap_ms / 1000)
-    return True
+    # 2. Rounds de burst + re-probe (caso deep sleep)
+    for _ in range(max_rounds):
+        for _ in range(pings_per_round):
+            keep_awake(h, dev_idx)
+            time.sleep(gap_ms / 1000)
+        if hidpp_call(h, dev_idx, 0x00, 1, b'\x00\x00\x00', timeout_ms=80) is not None:
+            return True
+    return False
 
 
 def find_fresh_path(product_id, usage_page):
@@ -308,8 +312,7 @@ def _invalidate(t):
 def watch_loop(targets, cfg, stop_event, on_switch=None, on_status=None):
     """Loop principal. Le cfg dinamicamente (hot reload de edge/target/etc).
 
-    cfg precisa expor: edge, target_host_idx, hold_ms, cooldown_ms,
-    keepalive_s, paused.
+    cfg precisa expor: edge, target_host_idx, hold_ms, cooldown_ms, paused.
     stop_event: threading.Event - encerra quando setado.
     on_switch(target_host, results): callback apos cada disparo.
     on_status(msg): callback opcional pra status (reconectado etc).
@@ -319,7 +322,6 @@ def watch_loop(targets, cfg, stop_event, on_switch=None, on_status=None):
 
     stuck = None
     armed = True  # so re-dispara apos cursor sair da borda
-    last_keepalive = 0.0
     last_reopen = {t['name']: 0.0 for t in targets}
     reopen_s = 2.0
 
@@ -336,7 +338,7 @@ def watch_loop(targets, cfg, stop_event, on_switch=None, on_status=None):
 
         now_s = time.time()
 
-        # Reabre handles invalidos
+        # Reabre handles invalidos (devices que voltaram apos switch anterior)
         for t in targets:
             if t['handle'] is None and now_s - last_reopen[t['name']] > reopen_s:
                 h, _ = reopen_handle(t['product_id'], t['usage_page'], t['dev_idx'])
@@ -344,15 +346,6 @@ def watch_loop(targets, cfg, stop_event, on_switch=None, on_status=None):
                     t['handle'] = h
                     status(f"{t['name']} reconectado")
                 last_reopen[t['name']] = now_s
-
-        # Keep-alive
-        if now_s - last_keepalive > cfg.keepalive_s:
-            for t in targets:
-                if t['handle'] is not None:
-                    if not keep_awake(t['handle'], t['dev_idx']):
-                        _invalidate(t)
-                        status(f"{t['name']} keep-alive falhou")
-            last_keepalive = now_s
 
         # Edge detection (virtual screen, abrange todos os monitores)
         xmin, _ymin, xmax, _ymax = virtual_screen_bounds()
@@ -428,7 +421,6 @@ def _cli_watch(argv):
         target_host_idx: int = opts['target']
         hold_ms: int = opts['hold']
         cooldown_ms: int = 800
-        keepalive_s: float = 3.0
         paused: bool = False
 
     print("Descobrindo devices Logitech...")
