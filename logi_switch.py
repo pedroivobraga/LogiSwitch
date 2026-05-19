@@ -453,12 +453,20 @@ def watch_loop(targets, cfg, stop_event, on_switch=None, on_status=None):
     last_reopen = {t['name']: 0.0 for t in targets}
     reopen_s = 2.0
     last_fire_ts = 0.0  # quando rodamos CHANGE_HOST por edge - pra ignorar
-                        # notificacoes que sao consequencia da nossa propria acao
-    OURS_WINDOW = 3.0   # segundos apos edge-fire em que ignoramos notificacoes
+                        # eventos que sao consequencia da nossa propria acao
+    OURS_WINDOW = 4.0   # segundos apos edge-fire em que ignoramos disconnects
 
     # Classifica targets por tipo - so teclados originam mirroring
     keyboards = [t for t in targets if is_keyboard(t)]
     mice = [t for t in targets if not is_keyboard(t)]
+
+    # Deteccao de saida: enumera periodicamente. Se um teclado some, o
+    # usuario apertou F2/F3 no teclado e ele foi pro outro PC.
+    last_enumerate_check = 0.0
+    ENUMERATE_INTERVAL_S = 1.0
+    keyboard_was_present = {kb['name']: True for kb in keyboards}
+    keyboard_miss_count = {kb['name']: 0 for kb in keyboards}
+    REQUIRED_MISSES = 2  # 2x miss = ~2s sem ver, evita falso positivo de hiccup BT
 
     def status(msg):
         if on_status:
@@ -498,27 +506,37 @@ def watch_loop(targets, cfg, stop_event, on_switch=None, on_status=None):
                     status(f"{t['name']} reconectado")
                 last_reopen[t['name']] = now_s
 
-        # Listener de notificacoes HID++ em teclados (botao Easy-Switch fisico)
-        # Faz read nao-bloqueante de cada handle. Notificacoes vem espontaneamente
-        # quando o usuario aperta F1/F2/F3. Filtra responses da nossa SW_ID.
-        if now_s - last_fire_ts > OURS_WINDOW:  # nao reage a ecos do nosso fire
-            for kb in keyboards:
-                # Aceita notificacoes de varios features que podem indicar host change
-                accepted = set()
-                for k in ('change_host_feat_idx', 'hosts_info_feat_idx',
-                          'wireless_status_feat_idx'):
-                    fi = kb.get(k)
-                    if fi is not None:
-                        accepted.add(fi)
-                if not accepted:
-                    continue
-                for report in poll_notifications(kb):
-                    new_host = parse_host_notification(report, accepted)
-                    if new_host is not None and new_host != kb.get('current_host'):
-                        mirror_mice_to_host(new_host, kb['name'])
-                        kb['current_host'] = new_host
-                        _invalidate(kb)  # teclado vai sair do radio - re-enumera depois
-                        break
+        # Deteccao de saida: enumera HIDs e detecta quando teclado some.
+        # Quando o usuario aperta F2/F3 no K850, ele desconecta do BT deste
+        # PC e some da enumeracao do Windows. A gente vê isso e espelha o
+        # mouse pra mesma direcao.
+        if now_s - last_enumerate_check >= ENUMERATE_INTERVAL_S:
+            last_enumerate_check = now_s
+            present_pids = set()
+            try:
+                for d in hid.enumerate(LOGI_VID, 0):
+                    if d.get('usage_page') in HIDPP_USAGE_PAGES:
+                        present_pids.add(d['product_id'])
+            except Exception:
+                present_pids = None  # se enumeracao falhar, pula esse ciclo
+
+            if present_pids is not None:
+                for kb in keyboards:
+                    currently_present = kb['product_id'] in present_pids
+                    if currently_present:
+                        keyboard_miss_count[kb['name']] = 0
+                        keyboard_was_present[kb['name']] = True
+                        continue
+                    keyboard_miss_count[kb['name']] += 1
+                    if (keyboard_was_present[kb['name']]
+                            and keyboard_miss_count[kb['name']] >= REQUIRED_MISSES):
+                        # Saida confirmada. Foi nossa ou manual?
+                        if now_s - last_fire_ts > OURS_WINDOW:
+                            # Manual - teclado foi pro outro PC pela borda fisica
+                            status(f"{kb['name']} desapareceu (F-key manual)")
+                            mirror_mice_to_host(cfg.target_host_idx, kb['name'])
+                            _invalidate(kb)
+                        keyboard_was_present[kb['name']] = False
 
         # Edge detection (virtual screen, abrange todos os monitores)
         xmin, _ymin, xmax, _ymax = virtual_screen_bounds()
