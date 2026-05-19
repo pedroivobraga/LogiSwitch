@@ -44,7 +44,7 @@ even when the two PCs cannot reach each other on the network.
 ### Tray app (recommended)
 
 ```powershell
-pythonw app.py
+pythonw source\logiswitch\app.py
 ```
 
 A system tray icon appears with a context menu:
@@ -61,10 +61,10 @@ displays.
 ### CLI (no tray)
 
 ```powershell
-python logi_switch.py list                                          # list interfaces
-python logi_switch.py scan [VID]                                    # list raw HID devices
-python logi_switch.py discover                                      # show CHANGE_HOST-capable targets
-python logi_switch.py watch --edge right --target 0 --hold 80       # blocking watch loop
+python source\logiswitch\logi_switch.py list                                    # list interfaces
+python source\logiswitch\logi_switch.py scan [VID]                              # list raw HID devices
+python source\logiswitch\logi_switch.py discover                                # show CHANGE_HOST-capable targets
+python source\logiswitch\logi_switch.py watch --edge right --target 0 --hold 80 # blocking watch loop
 ```
 
 `--target` is 0-based: `0` = Easy-Switch channel 1, `1` = channel 2, `2` = channel 3.
@@ -74,11 +74,23 @@ Add `--debug` before the command to see raw HID++ TX/RX bytes.
 ## Project layout
 
 ```
-logi_switch.py    HID++ core + CLI
-config.py         dataclass + JSON persistence (%APPDATA%\LogiSwitch\config.json)
-settings_ui.py    tkinter settings window
-app.py            pystray tray app, watch coordinator
+source/
+  logiswitch/
+    __init__.py
+    logi_switch.py    HID++ core + CLI
+    config.py         dataclass + JSON persistence (%APPDATA%\LogiSwitch\config.json)
+    settings_ui.py    tkinter settings window
+    app.py            pystray tray app, watch coordinator
+README.md
+requirements.txt
+.gitignore
 ```
+
+Imports inside the package use plain module names (`import config as config_mod`,
+`import logi_switch as ls`) so the scripts can be executed directly from the
+package folder. Python adds the script's directory to `sys.path`, so running
+`python source\logiswitch\app.py` or `pythonw source\logiswitch\app.py` works
+without any extra `PYTHONPATH` setup.
 
 ## Caveats
 
