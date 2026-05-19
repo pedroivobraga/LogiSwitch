@@ -7,6 +7,7 @@ import time
 from PIL import Image, ImageDraw
 import pystray
 
+import autostart
 import config as config_mod
 import logi_switch as ls
 import settings_ui
@@ -102,6 +103,12 @@ class App:
         self.start_watch()
         self._refresh_icon()
 
+    def toggle_autostart(self, icon=None, _item=None):
+        autostart.toggle()
+        # Forca re-render do menu pra atualizar o checkmark
+        if icon is not None:
+            icon.update_menu()
+
     def quit_app(self, _icon=None, _item=None):
         self.stop_watch()
         if self.icon:
@@ -123,6 +130,11 @@ class App:
             ),
             pystray.MenuItem("Configuracoes...", self.open_settings),
             pystray.MenuItem("Re-detectar devices", self.rediscover),
+            pystray.MenuItem(
+                "Iniciar com Windows",
+                self.toggle_autostart,
+                checked=lambda _: autostart.is_enabled(),
+            ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Sair", self.quit_app),
         )
