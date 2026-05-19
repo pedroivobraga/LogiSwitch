@@ -150,13 +150,16 @@ def keep_awake(h, dev_idx):
 
 
 def wake_burst(h, dev_idx, attempts=8, gap_ms=50):
-    """Spread bursts mais largos pra dar tempo do radio BT acordar (~400ms)."""
-    ok = False
+    """Probe rapido primeiro: se ja responde, sai em ~10-80ms. Se nao,
+    cai pro burst longo pra acordar radio BT em deep sleep (~480ms total)."""
+    # Caso comum: keep-alive mantem device warm → probe responde rapido
+    if hidpp_call(h, dev_idx, 0x00, 1, b'\x00\x00\x00', timeout_ms=40) is not None:
+        return True
+    # Caso deep sleep: burst pra acordar o radio
     for _ in range(attempts):
-        if keep_awake(h, dev_idx):
-            ok = True
+        keep_awake(h, dev_idx)
         time.sleep(gap_ms / 1000)
-    return ok
+    return True
 
 
 def find_fresh_path(product_id, usage_page):
