@@ -474,19 +474,37 @@ def watch_loop(targets, cfg, stop_event, on_switch=None, on_status=None):
 
     def mirror_mice_to_host(new_host: int, source_name: str):
         """Espelha o new_host em todos os mice. Chamado quando detectamos
-        que o usuario apertou F1/F2/F3 no teclado."""
+        que o usuario apertou F1/F2/F3 no teclado. Faz wake + retry pra
+        cobrir mouse num estado meio zumbi devido a transicao BT."""
         nonlocal last_fire_ts
         status(f"{source_name}: host -> {new_host} (manual), espelhando mice")
+        last_fire_ts = time.time()  # marca cedo: evita re-trigger em cascata
         for m in mice:
             if m['handle'] is None:
+                status(f"  {m['name']}: handle invalido, pulando")
                 continue
+            # Wake antes do set_host pra garantir que o radio nao tá adormecido
             try:
-                set_host(m['handle'], m['dev_idx'], new_host,
-                         feat_idx=m.get('change_host_feat_idx'))
+                wake_burst(m['handle'], m['dev_idx'])
             except Exception:
                 pass
+            # Tenta 2 vezes com pausa entre - cobre o caso onde o primeiro
+            # write cai durante o instante em que o BT esta servindo a
+            # desconexao do teclado.
+            sent_ok = False
+            for attempt in range(2):
+                try:
+                    ok, msg = set_host(m['handle'], m['dev_idx'], new_host,
+                                       feat_idx=m.get('change_host_feat_idx'))
+                    sent_ok = sent_ok or ok
+                    status(f"  {m['name']}: attempt {attempt + 1} -> {msg}")
+                except Exception as e:
+                    status(f"  {m['name']}: attempt {attempt + 1} ERR {e}")
+                if attempt == 0:
+                    time.sleep(0.15)
             _invalidate(m)
-        last_fire_ts = time.time()
+            if not sent_ok:
+                status(f"  {m['name']}: TODOS os attempts falharam")
 
     while not stop_event.is_set():
         if cfg.paused:
